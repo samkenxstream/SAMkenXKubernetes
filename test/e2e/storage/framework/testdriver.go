@@ -141,7 +141,7 @@ func GetDriverTimeouts(driver TestDriver) *framework.TimeoutContext {
 	if d, ok := driver.(CustomTimeoutsTestDriver); ok {
 		return d.GetTimeouts()
 	}
-	return framework.NewTimeoutContextWithDefaults()
+	return framework.NewTimeoutContext()
 }
 
 // Capability represents a feature that a volume plugin supports
@@ -184,6 +184,9 @@ const (
 	// for dynamic provisioning exists, the driver is expected to provide
 	// capacity information for it.
 	CapCapacity Capability = "capacity"
+
+	// Anti-capability for drivers that do not support filesystem resizing of PVCs that are cloned or restored from a snapshot.
+	CapFSResizeFromSourceNotSupported Capability = "FSResizeFromSourceNotSupported"
 
 	// To support ReadWriteOncePod, the following CSI sidecars must be
 	// updated to these versions or greater:

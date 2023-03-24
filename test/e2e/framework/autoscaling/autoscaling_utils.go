@@ -29,6 +29,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	crdclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -965,6 +966,10 @@ func CreateCustomResourceDefinition(ctx context.Context, c crdclientset.Interfac
 func ExistsInDiscovery(crd *apiextensionsv1.CustomResourceDefinition, apiExtensionsClient crdclientset.Interface, version string) (bool, error) {
 	groupResource, err := apiExtensionsClient.Discovery().ServerResourcesForGroupVersion(crd.Spec.Group + "/" + version)
 	if err != nil {
+		// Ignore 404 errors as it means the resources doesn't exist
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	for _, g := range groupResource.APIResources {
@@ -1001,7 +1006,7 @@ func CreateCustomSubresourceInstance(ctx context.Context, namespace, name string
 	}
 	createdObjectMeta, err := meta.Accessor(instance)
 	if err != nil {
-		return nil, fmt.Errorf("Error while creating object meta: %v", err)
+		return nil, fmt.Errorf("Error while creating object meta: %w", err)
 	}
 	if len(createdObjectMeta.GetUID()) == 0 {
 		return nil, fmt.Errorf("Missing UUID: %v", instance)

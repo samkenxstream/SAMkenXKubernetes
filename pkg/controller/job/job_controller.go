@@ -93,7 +93,7 @@ type Controller struct {
 	// To allow injection of the following for testing.
 	updateStatusHandler func(ctx context.Context, job *batch.Job) (*batch.Job, error)
 	patchJobHandler     func(ctx context.Context, job *batch.Job, patch []byte) error
-	syncHandler         func(ctx context.Context, jobKey string) (bool, error)
+	syncHandler         func(ctx context.Context, jobKey string) error
 	// podStoreSynced returns true if the pod store has been synced at least once.
 	// Added as a member to the struct to allow injection for testing.
 	podStoreSynced cache.InformerSynced
@@ -126,6 +126,8 @@ type Controller struct {
 	podUpdateBatchPeriod time.Duration
 
 	clock clock.WithTicker
+
+	backoffRecordStore *backoffStore
 }
 
 // NewController creates a new Job controller that keeps the relevant pods
@@ -150,6 +152,7 @@ func newControllerWithClock(podInformer coreinformers.PodInformer, jobInformer b
 		broadcaster:           eventBroadcaster,
 		recorder:              eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
 		clock:                 clock,
+		backoffRecordStore:    newBackoffRecordStore(),
 	}
 	if feature.DefaultFeatureGate.Enabled(features.JobReadyPods) {
 		jm.podUpdateBatchPeriod = podUpdateBatchPeriod
@@ -312,8 +315,10 @@ func (jm *Controller) updatePod(old, cur interface{}) {
 		return
 	}
 
-	// the only time we want the backoff to kick-in, is when the pod failed
-	immediate := curPod.Status.Phase != v1.PodFailed
+	// the only time we want the backoff to kick-in, is when the pod failed for the first time.
+	// we don't want to re-calculate backoff for an update event when the tracking finalizer
+	// for a failed pod is removed.
+	immediate := !(curPod.Status.Phase == v1.PodFailed && oldPod.Status.Phase != v1.PodFailed)
 
 	// Don't check if oldPod has the finalizer, as during ownership transfer
 	// finalizers might be re-added and removed again in behalf of the new owner.
@@ -504,7 +509,9 @@ func (jm *Controller) enqueueControllerDelayed(obj interface{}, immediate bool, 
 
 	backoff := delay
 	if !immediate {
-		backoff = getBackoff(jm.queue, key)
+		if calculatedBackoff := getBackoff(jm.queue, key); calculatedBackoff > 0 {
+			backoff = calculatedBackoff
+		}
 	}
 
 	// TODO: Handle overlapping controllers better. Either disallow them at admission time or
@@ -540,11 +547,9 @@ func (jm *Controller) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer jm.queue.Done(key)
 
-	forget, err := jm.syncHandler(ctx, key.(string))
+	err := jm.syncHandler(ctx, key.(string))
 	if err == nil {
-		if forget {
-			jm.queue.Forget(key)
-		}
+		jm.queue.Forget(key)
 		return true
 	}
 
@@ -614,9 +619,9 @@ func (jm Controller) syncOrphanPod(ctx context.Context, key string) error {
 
 // getPodsForJob returns the set of pods that this Job should manage.
 // It also reconciles ControllerRef by adopting/orphaning, adding tracking
-// finalizers, if enabled.
+// finalizers.
 // Note that the returned Pods are pointers into the cache.
-func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job, withFinalizers bool) ([]*v1.Pod, error) {
+func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job) ([]*v1.Pod, error) {
 	selector, err := metav1.LabelSelectorAsSelector(j.Spec.Selector)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't convert Job selector: %v", err)
@@ -639,14 +644,10 @@ func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job, withFinal
 		}
 		return fresh, nil
 	})
-	var finalizers []string
-	if withFinalizers {
-		finalizers = append(finalizers, batch.JobTrackingFinalizer)
-	}
-	cm := controller.NewPodControllerRefManager(jm.podControl, j, selector, controllerKind, canAdoptFunc, finalizers...)
+	cm := controller.NewPodControllerRefManager(jm.podControl, j, selector, controllerKind, canAdoptFunc, batch.JobTrackingFinalizer)
 	// When adopting Pods, this operation adds an ownerRef and finalizers.
 	pods, err = cm.ClaimPods(ctx, pods)
-	if err != nil || !withFinalizers {
+	if err != nil {
 		return pods, err
 	}
 	// Set finalizer on adopted pods for the remaining calculations.
@@ -669,7 +670,7 @@ func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job, withFinal
 // syncJob will sync the job with the given key if it has had its expectations fulfilled, meaning
 // it did not expect to see any more of its pods created or deleted. This function is not meant to be invoked
 // concurrently with the same key.
-func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rErr error) {
+func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 	startTime := jm.clock.Now()
 	defer func() {
 		klog.V(4).Infof("Finished syncing job %q (%v)", key, jm.clock.Since(startTime))
@@ -677,10 +678,10 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if len(ns) == 0 || len(name) == 0 {
-		return false, fmt.Errorf("invalid job key %q: either namespace or name is missing", key)
+		return fmt.Errorf("invalid job key %q: either namespace or name is missing", key)
 	}
 	sharedJob, err := jm.jobLister.Jobs(ns).Get(name)
 	if err != nil {
@@ -688,21 +689,32 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 			klog.V(4).Infof("Job has been deleted: %v", key)
 			jm.expectations.DeleteExpectations(key)
 			jm.finalizerExpectations.deleteExpectations(key)
-			return true, nil
+
+			err := jm.backoffRecordStore.removeBackoffRecord(key)
+			if err != nil {
+				// re-syncing here as the record has to be removed for finished/deleted jobs
+				return fmt.Errorf("error removing backoff record %w", err)
+			}
+			return nil
 		}
-		return false, err
+		return err
 	}
 	// make a copy so we don't mutate the shared cache
 	job := *sharedJob.DeepCopy()
 
 	// if job was finished previously, we don't want to redo the termination
 	if IsJobFinished(&job) {
-		return true, nil
+		err := jm.backoffRecordStore.removeBackoffRecord(key)
+		if err != nil {
+			// re-syncing here as the record has to be removed for finished/deleted jobs
+			return fmt.Errorf("error removing backoff record %w", err)
+		}
+		return nil
 	}
 
 	if job.Spec.CompletionMode != nil && *job.Spec.CompletionMode != batch.NonIndexedCompletion && *job.Spec.CompletionMode != batch.IndexedCompletion {
 		jm.recorder.Event(&job, v1.EventTypeWarning, "UnknownCompletionMode", "Skipped Job sync because completion mode is unknown")
-		return false, nil
+		return nil
 	}
 
 	completionMode := getCompletionMode(&job)
@@ -718,30 +730,27 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 		metrics.JobSyncNum.WithLabelValues(completionMode, result, action).Inc()
 	}()
 
-	var expectedRmFinalizers sets.String
-	var uncounted *uncountedTerminatedPods
-	if hasJobTrackingAnnotation(&job) {
-		klog.V(4).InfoS("Tracking uncounted Pods with pod finalizers", "job", klog.KObj(&job))
-		if job.Status.UncountedTerminatedPods == nil {
-			job.Status.UncountedTerminatedPods = &batch.UncountedTerminatedPods{}
-		}
-		uncounted = newUncountedTerminatedPods(*job.Status.UncountedTerminatedPods)
-		expectedRmFinalizers = jm.finalizerExpectations.getExpectedUIDs(key)
+	if job.Status.UncountedTerminatedPods == nil {
+		job.Status.UncountedTerminatedPods = &batch.UncountedTerminatedPods{}
 	}
+	uncounted := newUncountedTerminatedPods(*job.Status.UncountedTerminatedPods)
+	expectedRmFinalizers := jm.finalizerExpectations.getExpectedUIDs(key)
 
 	// Check the expectations of the job before counting active pods, otherwise a new pod can sneak in
 	// and update the expectations after we've retrieved active pods from the store. If a new pod enters
 	// the store after we've checked the expectation, the job sync is just deferred till the next relist.
 	satisfiedExpectations := jm.expectations.SatisfiedExpectations(key)
 
-	pods, err := jm.getPodsForJob(ctx, &job, uncounted != nil)
+	pods, err := jm.getPodsForJob(ctx, &job)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	activePods := controller.FilterActivePods(pods)
 	active := int32(len(activePods))
-	succeeded, failed := getStatus(&job, pods, uncounted, expectedRmFinalizers)
+	newSucceededPods, newFailedPods := getNewFinishedPods(&job, pods, uncounted, expectedRmFinalizers)
+	succeeded := job.Status.Succeeded + int32(len(newSucceededPods)) + int32(len(uncounted.succeeded))
+	failed := job.Status.Failed + int32(len(newFailedPods)) + int32(len(uncounted.failed))
 	var ready *int32
 	if feature.DefaultFeatureGate.Enabled(features.JobReadyPods) {
 		ready = pointer.Int32(countReadyPods(activePods))
@@ -752,6 +761,8 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 		now := metav1.NewTime(jm.clock.Now())
 		job.Status.StartTime = &now
 	}
+
+	newBackoffInfo := jm.backoffRecordStore.newBackoffRecord(jm.clock, key, newSucceededPods, newFailedPods)
 
 	var manageJobErr error
 	var finishedCondition *batch.JobCondition
@@ -767,13 +778,8 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 		if failureTargetCondition := findConditionByType(job.Status.Conditions, batch.JobFailureTarget); failureTargetCondition != nil {
 			finishedCondition = newFailedConditionForFailureTarget(failureTargetCondition, jm.clock.Now())
 		} else if failJobMessage := getFailJobMessage(&job, pods, uncounted.Failed()); failJobMessage != nil {
-			if uncounted != nil {
-				// Prepare the interim FailureTarget condition to record the failure message before the finalizers (allowing removal of the pods) are removed.
-				finishedCondition = newCondition(batch.JobFailureTarget, v1.ConditionTrue, jobConditionReasonPodFailurePolicy, *failJobMessage, jm.clock.Now())
-			} else {
-				// Prepare the Failed job condition for the legacy path without finalizers (don't use the interim FailureTarget condition).
-				finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, jobConditionReasonPodFailurePolicy, *failJobMessage, jm.clock.Now())
-			}
+			// Prepare the interim FailureTarget condition to record the failure message before the finalizers (allowing removal of the pods) are removed.
+			finishedCondition = newCondition(batch.JobFailureTarget, v1.ConditionTrue, jobConditionReasonPodFailurePolicy, *failJobMessage, jm.clock.Now())
 		}
 	}
 	if finishedCondition == nil {
@@ -799,21 +805,17 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 	// Remove active pods if Job failed.
 	if finishedCondition != nil {
 		deleted, err := jm.deleteActivePods(ctx, &job, activePods)
-		if uncounted == nil {
-			// Legacy behavior: pretend all active pods were successfully removed.
-			deleted = active
-		} else if deleted != active || !satisfiedExpectations {
+		if deleted != active || !satisfiedExpectations {
 			// Can't declare the Job as finished yet, as there might be remaining
 			// pod finalizers or pods that are not in the informer's cache yet.
 			finishedCondition = nil
 		}
 		active -= deleted
-		failed += deleted
 		manageJobErr = err
 	} else {
 		manageJobCalled := false
 		if satisfiedExpectations && job.DeletionTimestamp == nil {
-			active, action, manageJobErr = jm.manageJob(ctx, &job, activePods, succeeded, succeededIndexes)
+			active, action, manageJobErr = jm.manageJob(ctx, &job, activePods, succeeded, succeededIndexes, newBackoffInfo)
 			manageJobCalled = true
 		}
 		complete := false
@@ -866,63 +868,27 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (forget bool, rEr
 		}
 	}
 
-	// Check if the number of jobs succeeded increased since the last check. If yes "forget" should be true
-	// This logic is linked to the issue: https://github.com/kubernetes/kubernetes/issues/56853 that aims to
-	// improve the Job backoff policy when parallelism > 1 and few Jobs failed but others succeed.
-	// In this case, we should clear the backoff delay.
-	forget = job.Status.Succeeded < succeeded
-
-	if uncounted != nil {
-		needsStatusUpdate := suspendCondChanged || active != job.Status.Active || !equalReady(ready, job.Status.Ready)
-		job.Status.Active = active
-		job.Status.Ready = ready
-		err = jm.trackJobStatusAndRemoveFinalizers(ctx, &job, pods, prevSucceededIndexes, *uncounted, expectedRmFinalizers, finishedCondition, needsStatusUpdate)
-		if err != nil {
-			return false, fmt.Errorf("tracking status: %w", err)
+	needsStatusUpdate := suspendCondChanged || active != job.Status.Active || !equalReady(ready, job.Status.Ready)
+	job.Status.Active = active
+	job.Status.Ready = ready
+	err = jm.trackJobStatusAndRemoveFinalizers(ctx, &job, pods, prevSucceededIndexes, *uncounted, expectedRmFinalizers, finishedCondition, needsStatusUpdate, newBackoffInfo)
+	if err != nil {
+		if apierrors.IsConflict(err) {
+			// we probably have a stale informer cache
+			// so don't return an error to avoid backoff
+			jm.enqueueController(&job, false)
+			return nil
 		}
-		jobFinished := IsJobFinished(&job)
-		if jobHasNewFailure && !jobFinished {
-			// returning an error will re-enqueue Job after the backoff period
-			return forget, fmt.Errorf("failed pod(s) detected for job key %q", key)
-		}
-		forget = true
-		return forget, manageJobErr
-	}
-	// Legacy path: tracking without finalizers.
-
-	// Ensure that there are no leftover tracking finalizers.
-	if err := jm.removeTrackingFinalizersFromAllPods(ctx, pods); err != nil {
-		return false, fmt.Errorf("removing disabled finalizers from job pods %s: %w", key, err)
+		return fmt.Errorf("tracking status: %w", err)
 	}
 
-	// no need to update the job if the status hasn't changed since last time
-	if job.Status.Active != active || job.Status.Succeeded != succeeded || job.Status.Failed != failed || !equalReady(job.Status.Ready, ready) || suspendCondChanged || finishedCondition != nil {
-		job.Status.Active = active
-		job.Status.Succeeded = succeeded
-		job.Status.Failed = failed
-		job.Status.Ready = ready
-		if isIndexedJob(&job) {
-			job.Status.CompletedIndexes = succeededIndexes.String()
-		}
-		job.Status.UncountedTerminatedPods = nil
-		jobFinished := jm.enactJobFinished(&job, finishedCondition)
-
-		if _, err := jm.updateStatusHandler(ctx, &job); err != nil {
-			return forget, err
-		}
-		if jobFinished {
-			jm.recordJobFinished(&job, finishedCondition)
-		}
-
-		if jobHasNewFailure && !IsJobFinished(&job) {
-			// returning an error will re-enqueue Job after the backoff period
-			return forget, fmt.Errorf("failed pod(s) detected for job key %q", key)
-		}
-
-		forget = true
+	jobFinished := IsJobFinished(&job)
+	if jobHasNewFailure && !jobFinished {
+		// returning an error will re-enqueue Job after the backoff period
+		return fmt.Errorf("failed pod(s) detected for job key %q", key)
 	}
 
-	return forget, manageJobErr
+	return manageJobErr
 }
 
 // deleteActivePods issues deletion for active Pods, preserving finalizers.
@@ -986,23 +952,6 @@ func (jm *Controller) deleteJobPods(ctx context.Context, job *batch.Job, jobKey 
 	return successfulDeletes, errorFromChannel(errCh)
 }
 
-// removeTrackingFinalizersFromAllPods removes finalizers from any Job Pod. This is called
-// when Job tracking with finalizers is disabled.
-func (jm *Controller) removeTrackingFinalizersFromAllPods(ctx context.Context, pods []*v1.Pod) error {
-	var podsWithFinalizer []*v1.Pod
-	for _, pod := range pods {
-		if hasJobTrackingFinalizer(pod) {
-			podsWithFinalizer = append(podsWithFinalizer, pod)
-		}
-	}
-	if len(podsWithFinalizer) == 0 {
-		return nil
-	}
-	// Tracking with finalizers is disabled, no need to set expectations.
-	_, err := jm.removeTrackingFinalizerFromPods(ctx, "", podsWithFinalizer)
-	return err
-}
-
 // trackJobStatusAndRemoveFinalizers does:
 //  1. Add finished Pods to .status.uncountedTerminatedPods
 //  2. Remove the finalizers from the Pods if they completed or were removed
@@ -1012,7 +961,7 @@ func (jm *Controller) removeTrackingFinalizersFromAllPods(ctx context.Context, p
 //
 // It does this up to a limited number of Pods so that the size of .status
 // doesn't grow too much and this sync doesn't starve other Jobs.
-func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job *batch.Job, pods []*v1.Pod, succeededIndexes orderedIntervals, uncounted uncountedTerminatedPods, expectedRmFinalizers sets.String, finishedCond *batch.JobCondition, needsFlush bool) error {
+func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job *batch.Job, pods []*v1.Pod, succeededIndexes orderedIntervals, uncounted uncountedTerminatedPods, expectedRmFinalizers sets.String, finishedCond *batch.JobCondition, needsFlush bool, newBackoffRecord backoffRecord) error {
 	isIndexed := isIndexedJob(job)
 	var podsToRemoveFinalizer []*v1.Pod
 	uncountedStatus := job.Status.UncountedTerminatedPods
@@ -1028,6 +977,7 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 			uidsWithFinalizer.Insert(uid)
 		}
 	}
+
 	// Shallow copy, as it will only be used to detect changes in the counters.
 	oldCounters := job.Status
 	if cleanUncountedPodsWithoutFinalizers(&job.Status, uidsWithFinalizer) {
@@ -1053,7 +1003,7 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 			// considerTerminated || job.DeletionTimestamp != nil
 			considerTerminated = podutil.IsPodTerminal(pod) ||
 				finishedCond != nil || // The Job is terminating. Any running Pod is considered failed.
-				isPodFailed(pod, job, true /* using finalizers */)
+				isPodFailed(pod, job)
 		}
 		if podutil.IsPodTerminal(pod) || considerTerminated || job.DeletionTimestamp != nil {
 			podsToRemoveFinalizer = append(podsToRemoveFinalizer, pod)
@@ -1101,10 +1051,14 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 			break
 		}
 	}
-	if len(newSucceededIndexes) > 0 {
+	if isIndexed {
 		succeededIndexes = succeededIndexes.withOrderedIndexes(newSucceededIndexes)
+		succeededIndexesStr := succeededIndexes.String()
+		if succeededIndexesStr != job.Status.CompletedIndexes {
+			needsFlush = true
+		}
 		job.Status.Succeeded = int32(succeededIndexes.total())
-		job.Status.CompletedIndexes = succeededIndexes.String()
+		job.Status.CompletedIndexes = succeededIndexesStr
 	}
 	if feature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) {
 		if finishedCond != nil && finishedCond.Type == batch.JobFailureTarget {
@@ -1119,7 +1073,7 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 		}
 	}
 	var err error
-	if job, needsFlush, err = jm.flushUncountedAndRemoveFinalizers(ctx, job, podsToRemoveFinalizer, uidsWithFinalizer, &oldCounters, podFailureCountByPolicyAction, needsFlush); err != nil {
+	if job, needsFlush, err = jm.flushUncountedAndRemoveFinalizers(ctx, job, podsToRemoveFinalizer, uidsWithFinalizer, &oldCounters, podFailureCountByPolicyAction, needsFlush, newBackoffRecord); err != nil {
 		return err
 	}
 	jobFinished := jm.enactJobFinished(job, finishedCond)
@@ -1149,12 +1103,22 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 //
 // Returns whether there are pending changes in the Job status that need to be
 // flushed in subsequent calls.
-func (jm *Controller) flushUncountedAndRemoveFinalizers(ctx context.Context, job *batch.Job, podsToRemoveFinalizer []*v1.Pod, uidsWithFinalizer sets.String, oldCounters *batch.JobStatus, podFailureCountByPolicyAction map[string]int, needsFlush bool) (*batch.Job, bool, error) {
+func (jm *Controller) flushUncountedAndRemoveFinalizers(ctx context.Context, job *batch.Job, podsToRemoveFinalizer []*v1.Pod, uidsWithFinalizer sets.String, oldCounters *batch.JobStatus, podFailureCountByPolicyAction map[string]int, needsFlush bool, newBackoffRecord backoffRecord) (*batch.Job, bool, error) {
 	var err error
 	if needsFlush {
 		if job, err = jm.updateStatusHandler(ctx, job); err != nil {
 			return job, needsFlush, fmt.Errorf("adding uncounted pods to status: %w", err)
 		}
+
+		err = jm.backoffRecordStore.updateBackoffRecord(newBackoffRecord)
+
+		if err != nil {
+			// this error might undercount the backoff.
+			// re-syncing from the current state might not help to recover
+			// the backoff information
+			klog.ErrorS(err, "Backoff update failed")
+		}
+
 		recordJobPodFinished(job, *oldCounters)
 		// Shallow copy, as it will only be used to detect changes in the counters.
 		*oldCounters = job.Status
@@ -1361,7 +1325,7 @@ func getFailJobMessage(job *batch.Job, pods []*v1.Pod, uncounted sets.String) *s
 		return nil
 	}
 	for _, p := range pods {
-		if isPodFailed(p, job, uncounted != nil) {
+		if isPodFailed(p, job) {
 			jobFailureMessage, _, _ := matchPodFailurePolicy(job.Spec.PodFailurePolicy, p)
 			if jobFailureMessage != nil {
 				return jobFailureMessage
@@ -1371,28 +1335,24 @@ func getFailJobMessage(job *batch.Job, pods []*v1.Pod, uncounted sets.String) *s
 	return nil
 }
 
-// getStatus returns number of succeeded and failed pods running a job. The number
-// of failed pods can be affected by the podFailurePolicy.
-func getStatus(job *batch.Job, pods []*v1.Pod, uncounted *uncountedTerminatedPods, expectedRmFinalizers sets.String) (succeeded, failed int32) {
-	if uncounted != nil {
-		succeeded = job.Status.Succeeded
-		failed = job.Status.Failed
-	}
-	succeeded += int32(countValidPodsWithFilter(job, pods, uncounted.Succeeded(), expectedRmFinalizers, func(p *v1.Pod) bool {
+// getNewFinishedPods returns the list of newly succeeded and failed pods that are not accounted
+// in the job status. The list of failed pods can be affected by the podFailurePolicy.
+func getNewFinishedPods(job *batch.Job, pods []*v1.Pod, uncounted *uncountedTerminatedPods, expectedRmFinalizers sets.String) (succeededPods, failedPods []*v1.Pod) {
+	succeededPods = getValidPodsWithFilter(job, pods, uncounted.Succeeded(), expectedRmFinalizers, func(p *v1.Pod) bool {
 		return p.Status.Phase == v1.PodSucceeded
-	}))
-	failed += int32(countValidPodsWithFilter(job, pods, uncounted.Failed(), expectedRmFinalizers, func(p *v1.Pod) bool {
+	})
+	failedPods = getValidPodsWithFilter(job, pods, uncounted.Failed(), expectedRmFinalizers, func(p *v1.Pod) bool {
 		if feature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) && job.Spec.PodFailurePolicy != nil {
-			if !isPodFailed(p, job, uncounted != nil) {
+			if !isPodFailed(p, job) {
 				return false
 			}
 			_, countFailed, _ := matchPodFailurePolicy(job.Spec.PodFailurePolicy, p)
 			return countFailed
 		} else {
-			return isPodFailed(p, job, uncounted != nil)
+			return isPodFailed(p, job)
 		}
-	}))
-	return succeeded, failed
+	})
+	return succeededPods, failedPods
 }
 
 // jobSuspended returns whether a Job is suspended while taking the feature
@@ -1403,8 +1363,9 @@ func jobSuspended(job *batch.Job) bool {
 
 // manageJob is the core method responsible for managing the number of running
 // pods according to what is specified in the job.Spec.
+// Respects back-off; does not create new pods if the back-off time has not passed
 // Does NOT modify <activePods>.
-func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, activePods []*v1.Pod, succeeded int32, succeededIndexes []interval) (int32, string, error) {
+func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, activePods []*v1.Pod, succeeded int32, succeededIndexes []interval, backoff backoffRecord) (int32, string, error) {
 	active := int32(len(activePods))
 	parallelism := *job.Spec.Parallelism
 	jobKey, err := controller.KeyFunc(job)
@@ -1465,6 +1426,11 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, activePods 
 	}
 
 	if active < wantActive {
+		remainingTime := backoff.getRemainingTime(jm.clock, DefaultJobBackOff, MaxJobBackOff)
+		if remainingTime > 0 {
+			jm.enqueueControllerDelayed(job, true, remainingTime)
+			return 0, metrics.JobSyncActionPodsCreated, nil
+		}
 		diff := wantActive - active
 		if diff > int32(MaxPodCreateDeletePerSync) {
 			diff = int32(MaxPodCreateDeletePerSync)
@@ -1487,9 +1453,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, activePods 
 		if isIndexedJob(job) {
 			addCompletionIndexEnvVariables(podTemplate)
 		}
-		if hasJobTrackingAnnotation(job) {
-			podTemplate.Finalizers = appendJobCompletionFinalizerIfNotFound(podTemplate.Finalizers)
-		}
+		podTemplate.Finalizers = appendJobCompletionFinalizerIfNotFound(podTemplate.Finalizers)
 
 		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
 		// and double with each successful iteration in a kind of "slow start".
@@ -1613,16 +1577,17 @@ func getBackoff(queue workqueue.RateLimitingInterface, key interface{}) time.Dur
 	return calculated
 }
 
-// countValidPodsWithFilter returns number of valid pods that pass the filter.
-// Pods are valid if they have a finalizer and, for Indexed Jobs, a valid
-// completion index.
-func countValidPodsWithFilter(job *batch.Job, pods []*v1.Pod, uncounted sets.String, expectedRmFinalizers sets.String, filter func(*v1.Pod) bool) int {
-	result := len(uncounted)
+// getValidPodsWithFilter returns the valid pods that pass the filter.
+// Pods are valid if they have a finalizer or in uncounted set
+// and, for Indexed Jobs, a valid completion index.
+func getValidPodsWithFilter(job *batch.Job, pods []*v1.Pod, uncounted sets.String, expectedRmFinalizers sets.String, filter func(*v1.Pod) bool) []*v1.Pod {
+	var result []*v1.Pod
 	for _, p := range pods {
 		uid := string(p.UID)
+
 		// Pods that don't have a completion finalizer are in the uncounted set or
 		// have already been accounted for in the Job status.
-		if uncounted != nil && (!hasJobTrackingFinalizer(p) || uncounted.Has(uid) || expectedRmFinalizers.Has(uid)) {
+		if !hasJobTrackingFinalizer(p) || uncounted.Has(uid) || expectedRmFinalizers.Has(uid) {
 			continue
 		}
 		if isIndexedJob(job) {
@@ -1632,7 +1597,7 @@ func countValidPodsWithFilter(job *batch.Job, pods []*v1.Pod, uncounted sets.Str
 			}
 		}
 		if filter(p) {
-			result++
+			result = append(result, p)
 		}
 	}
 	return result
@@ -1644,14 +1609,6 @@ func getCompletionMode(job *batch.Job) string {
 		return string(batch.IndexedCompletion)
 	}
 	return string(batch.NonIndexedCompletion)
-}
-
-func hasJobTrackingAnnotation(job *batch.Job) bool {
-	if job.Annotations == nil {
-		return false
-	}
-	_, ok := job.Annotations[batch.JobTrackingFinalizer]
-	return ok
 }
 
 func appendJobCompletionFinalizerIfNotFound(finalizers []string) []string {
@@ -1739,7 +1696,7 @@ func ensureJobConditionStatus(list []batch.JobCondition, cType batch.JobConditio
 	return list, false
 }
 
-func isPodFailed(p *v1.Pod, job *batch.Job, wFinalizers bool) bool {
+func isPodFailed(p *v1.Pod, job *batch.Job) bool {
 	if feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) && feature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) && job.Spec.PodFailurePolicy != nil {
 		// When PodDisruptionConditions is enabled, orphan Pods and unschedulable
 		// terminating Pods are marked as Failed. So we only need to check the phase.
@@ -1751,10 +1708,9 @@ func isPodFailed(p *v1.Pod, job *batch.Job, wFinalizers bool) bool {
 	if p.Status.Phase == v1.PodFailed {
 		return true
 	}
-	// When tracking with finalizers: counting deleted Pods as failures to
-	// account for orphan Pods that never have a chance to reach the Failed
-	// phase.
-	return wFinalizers && p.DeletionTimestamp != nil && p.Status.Phase != v1.PodSucceeded
+	// Count deleted Pods as failures to account for orphan Pods that
+	// never have a chance to reach the Failed phase.
+	return p.DeletionTimestamp != nil && p.Status.Phase != v1.PodSucceeded
 }
 
 func findConditionByType(list []batch.JobCondition, cType batch.JobConditionType) *batch.JobCondition {
@@ -1768,9 +1724,24 @@ func findConditionByType(list []batch.JobCondition, cType batch.JobConditionType
 
 func recordJobPodFinished(job *batch.Job, oldCounters batch.JobStatus) {
 	completionMode := completionModeStr(job)
-	diff := job.Status.Succeeded - oldCounters.Succeeded
+	var diff int
+
+	// Updating succeeded metric must be handled differently
+	// for Indexed Jobs to handle the case where the job has
+	// been scaled down by reducing completions & parallelism
+	// in tandem, and now a previously completed index is
+	// now out of range (i.e. index >= spec.Completions).
+	if isIndexedJob(job) {
+		if job.Status.CompletedIndexes != oldCounters.CompletedIndexes {
+			diff = succeededIndexesFromString(job.Status.CompletedIndexes, int(*job.Spec.Completions)).total() - succeededIndexesFromString(oldCounters.CompletedIndexes, int(*job.Spec.Completions)).total()
+		}
+	} else {
+		diff = int(job.Status.Succeeded) - int(oldCounters.Succeeded)
+	}
 	metrics.JobPodsFinished.WithLabelValues(completionMode, metrics.Succeeded).Add(float64(diff))
-	diff = job.Status.Failed - oldCounters.Failed
+
+	// Update failed metric.
+	diff = int(job.Status.Failed - oldCounters.Failed)
 	metrics.JobPodsFinished.WithLabelValues(completionMode, metrics.Failed).Add(float64(diff))
 }
 

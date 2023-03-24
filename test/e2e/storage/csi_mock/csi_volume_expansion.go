@@ -46,6 +46,7 @@ const (
 	expansionFailed
 	expansionFailedOnController
 	expansionFailedOnNode
+	expansionFailedMissingStagingPath
 )
 
 const (
@@ -78,25 +79,35 @@ var _ = utils.SIGDescribe("CSI Mock volume expansion", func() {
 			nodeExpansionRequired   bool
 			disableAttach           bool
 			disableResizingOnDriver bool
+			simulatedCSIDriverError expansionStatus
 			expectFailure           bool
 		}{
 			{
-				name:                  "should expand volume without restarting pod if nodeExpansion=off",
-				nodeExpansionRequired: false,
+				name:                    "should expand volume without restarting pod if nodeExpansion=off",
+				nodeExpansionRequired:   false,
+				simulatedCSIDriverError: expansionSuccess,
 			},
 			{
-				name:                  "should expand volume by restarting pod if attach=on, nodeExpansion=on",
-				nodeExpansionRequired: true,
+				name:                    "should expand volume by restarting pod if attach=on, nodeExpansion=on",
+				nodeExpansionRequired:   true,
+				simulatedCSIDriverError: expansionSuccess,
 			},
 			{
-				name:                  "should expand volume by restarting pod if attach=off, nodeExpansion=on",
-				disableAttach:         true,
-				nodeExpansionRequired: true,
+				name:                    "should not have staging_path missing in node expand volume pod if attach=on, nodeExpansion=on",
+				nodeExpansionRequired:   true,
+				simulatedCSIDriverError: expansionFailedMissingStagingPath,
+			},
+			{
+				name:                    "should expand volume by restarting pod if attach=off, nodeExpansion=on",
+				disableAttach:           true,
+				nodeExpansionRequired:   true,
+				simulatedCSIDriverError: expansionSuccess,
 			},
 			{
 				name:                    "should not expand volume if resizingOnDriver=off, resizingOnSC=on",
 				disableResizingOnDriver: true,
 				expectFailure:           true,
+				simulatedCSIDriverError: expansionSuccess,
 			},
 		}
 		for _, t := range tests {
@@ -113,6 +124,7 @@ var _ = utils.SIGDescribe("CSI Mock volume expansion", func() {
 					tp.disableAttach = true
 					tp.registerDriver = true
 				}
+				tp.hooks = createExpansionHook(test.simulatedCSIDriverError)
 
 				m.init(ctx, tp)
 				ginkgo.DeferCleanup(m.cleanup)
@@ -172,8 +184,12 @@ var _ = utils.SIGDescribe("CSI Mock volume expansion", func() {
 					}
 
 					ginkgo.By("Deleting the previously created pod")
-					err = e2epod.DeletePodWithWait(ctx, m.cs, pod)
-					framework.ExpectNoError(err, "while deleting pod for resizing")
+					if test.simulatedCSIDriverError == expansionFailedMissingStagingPath {
+						e2epod.DeletePodOrFail(ctx, m.cs, pod.Namespace, pod.Name)
+					} else {
+						err = e2epod.DeletePodWithWait(ctx, m.cs, pod)
+						framework.ExpectNoError(err, "while deleting pod for resizing")
+					}
 
 					ginkgo.By("Creating a new pod with same volume")
 					pod2, err := m.createPodWithPVC(pvc)
@@ -182,6 +198,139 @@ var _ = utils.SIGDescribe("CSI Mock volume expansion", func() {
 
 					checkPVCSize()
 				}
+			})
+		}
+	})
+	ginkgo.Context("CSI online volume expansion with secret", func() {
+		var stringSecret = map[string]string{
+			"username": "admin",
+			"password": "t0p-Secret",
+		}
+		trackedCalls := []string{
+			"NodeExpandVolume",
+		}
+		tests := []struct {
+			name          string
+			disableAttach bool
+			expectedCalls []csiCall
+
+			// Called for each NodeExpandVolume calls, with counter incremented atomically before
+			// the invocation (i.e first value will be 1).
+			nodeExpandHook func(counter int64) error
+		}{
+			{
+				name: "should expand volume without restarting pod if attach=on, nodeExpansion=on, csiNodeExpandSecret=on",
+				expectedCalls: []csiCall{
+					{expectedMethod: "NodeExpandVolume", expectedError: codes.OK, expectedSecret: stringSecret},
+				},
+			},
+		}
+		for _, t := range tests {
+			test := t
+			ginkgo.It(test.name, func(ctx context.Context) {
+				var (
+					err        error
+					hooks      *drivers.Hooks
+					secretName = "test-secret"
+					secret     = &v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: f.Namespace.Name,
+							Name:      secretName,
+						},
+						StringData: stringSecret,
+					}
+				)
+				if test.nodeExpandHook != nil {
+					hooks = createPreHook("NodeExpandVolume", test.nodeExpandHook)
+				}
+				params := testParameters{enableResizing: true, enableNodeExpansion: true, enableCSINodeExpandSecret: true, hooks: hooks}
+				if test.disableAttach {
+					params.disableAttach = true
+					params.registerDriver = true
+				}
+
+				m.init(ctx, params)
+				ginkgo.DeferCleanup(m.cleanup)
+
+				if secret, err := m.cs.CoreV1().Secrets(f.Namespace.Name).Create(context.TODO(), secret, metav1.CreateOptions{}); err != nil {
+					framework.Failf("unable to create test secret %s: %v", secret.Name, err)
+				}
+
+				sc, pvc, pod := m.createPod(ctx, pvcReference)
+				gomega.Expect(pod).NotTo(gomega.BeNil(), "while creating pod for resizing")
+
+				if !*sc.AllowVolumeExpansion {
+					framework.Fail("failed creating sc with allowed expansion")
+				}
+				if sc.Parameters == nil {
+					framework.Fail("failed creating sc with secret")
+				}
+				if _, ok := sc.Parameters[csiNodeExpandSecretKey]; !ok {
+					framework.Failf("creating sc without %s", csiNodeExpandSecretKey)
+				}
+				if _, ok := sc.Parameters[csiNodeExpandSecretNamespaceKey]; !ok {
+					framework.Failf("creating sc without %s", csiNodeExpandSecretNamespaceKey)
+				}
+				err = e2epod.WaitForPodNameRunningInNamespace(ctx, m.cs, pod.Name, pod.Namespace)
+				framework.ExpectNoError(err, "Failed to start pod1: %v", err)
+
+				pvc, err = m.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+				if err != nil {
+					framework.Failf("failed to get pvc %s, %v", pvc.Name, err)
+				}
+				gomega.Expect(pvc.Spec.VolumeName).ShouldNot(gomega.BeEquivalentTo(""), "while provisioning a volume for resizing")
+				pv, err := m.cs.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+				if err != nil {
+					framework.Failf("failed to get pv %s, %v", pvc.Spec.VolumeName, err)
+				}
+				if pv.Spec.CSI == nil || pv.Spec.CSI.NodeExpandSecretRef == nil {
+					framework.Fail("creating pv without 'NodeExpandSecretRef'")
+				}
+				if pv.Spec.CSI.NodeExpandSecretRef.Namespace != f.Namespace.Name || pv.Spec.CSI.NodeExpandSecretRef.Name != secretName {
+					framework.Failf("failed to set node expand secret ref, namespace: %s name: %s", pv.Spec.CSI.NodeExpandSecretRef.Namespace, pv.Spec.CSI.NodeExpandSecretRef.Name)
+				}
+
+				ginkgo.By("Expanding current pvc")
+				newSize := resource.MustParse("6Gi")
+				newPVC, err := testsuites.ExpandPVCSize(ctx, pvc, newSize, m.cs)
+				framework.ExpectNoError(err, "While updating pvc for more size")
+				pvc = newPVC
+				gomega.Expect(pvc).NotTo(gomega.BeNil())
+
+				pvcSize := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+				if pvcSize.Cmp(newSize) != 0 {
+					framework.Failf("error updating pvc size %q", pvc.Name)
+				}
+
+				ginkgo.By("Waiting for persistent volume resize to finish")
+				err = testsuites.WaitForControllerVolumeResize(ctx, pvc, m.cs, csiResizeWaitPeriod)
+				framework.ExpectNoError(err, "While waiting for PV resize to finish")
+
+				ginkgo.By("Waiting for PVC resize to finish")
+				pvc, err = testsuites.WaitForFSResize(ctx, pvc, m.cs)
+				framework.ExpectNoError(err, "while waiting for PVC to finish")
+
+				ginkgo.By("Waiting for all remaining expected CSI calls")
+				err = wait.Poll(time.Second, csiResizeWaitPeriod, func() (done bool, err error) {
+					var index int
+					_, index, err = compareCSICalls(ctx, trackedCalls, test.expectedCalls, m.driver.GetCalls)
+					if err != nil {
+						return true, err
+					}
+					if index == 0 {
+						// No CSI call received yet
+						return false, nil
+					}
+					if len(test.expectedCalls) == index {
+						// all calls received
+						return true, nil
+					}
+					return false, nil
+				})
+				framework.ExpectNoError(err, "while waiting for all CSI calls")
+
+				pvcConditions := pvc.Status.Conditions
+				framework.ExpectEqual(len(pvcConditions), 0, "pvc should not have conditions")
 			})
 		}
 	})
@@ -400,7 +549,7 @@ func waitForResizeStatus(pvc *v1.PersistentVolumeClaim, c clientset.Interface, e
 		updatedPVC, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(context.TODO(), pvc.Name, metav1.GetOptions{})
 
 		if err != nil {
-			return false, fmt.Errorf("error fetching pvc %q for checking for resize status: %v", pvc.Name, err)
+			return false, fmt.Errorf("error fetching pvc %q for checking for resize status: %w", pvc.Name, err)
 		}
 
 		actualResizeStatus = updatedPVC.Status.ResizeStatus
@@ -426,7 +575,7 @@ func waitForAllocatedResource(pvc *v1.PersistentVolumeClaim, m *mockDriverSetup,
 		updatedPVC, err := m.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(context.TODO(), pvc.Name, metav1.GetOptions{})
 
 		if err != nil {
-			return false, fmt.Errorf("error fetching pvc %q for checking for resize status: %v", pvc.Name, err)
+			return false, fmt.Errorf("error fetching pvc %q for checking for resize status: %w", pvc.Name, err)
 		}
 		actualAllocatedSize := updatedPVC.Status.AllocatedResources.Storage()
 		if actualAllocatedSize != nil && actualAllocatedSize.Equal(expectedQuantity) {
@@ -445,6 +594,15 @@ func createExpansionHook(expectedExpansionStatus expansionStatus) *drivers.Hooks
 	return &drivers.Hooks{
 		Pre: func(ctx context.Context, method string, request interface{}) (reply interface{}, err error) {
 			switch expectedExpansionStatus {
+			case expansionFailedMissingStagingPath:
+				expansionRequest, ok := request.(*csipbv1.NodeExpandVolumeRequest)
+				if ok {
+					stagingPath := expansionRequest.StagingTargetPath
+					if stagingPath == "" {
+						return nil, status.Error(codes.InvalidArgument, "invalid node expansion request, missing staging path")
+					}
+
+				}
 			case expansionFailedOnController:
 				expansionRequest, ok := request.(*csipbv1.ControllerExpandVolumeRequest)
 				if ok {

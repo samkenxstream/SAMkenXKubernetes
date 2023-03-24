@@ -201,12 +201,20 @@ var _ = utils.SIGDescribe("PersistentVolumes-local ", func() {
 				}
 				setupStorageClass(ctx, config, &testMode)
 				testVols := setupLocalVolumesPVCsPVs(ctx, config, testVolType, config.randomNode, 1, testMode)
-				testVol = testVols[0]
+				if len(testVols) > 0 {
+					testVol = testVols[0]
+				} else {
+					framework.Failf("Failed to get a test volume")
+				}
 			})
 
 			ginkgo.AfterEach(func(ctx context.Context) {
-				cleanupLocalVolumes(ctx, config, []*localTestVolume{testVol})
-				cleanupStorageClass(ctx, config)
+				if testVol != nil {
+					cleanupLocalVolumes(ctx, config, []*localTestVolume{testVol})
+					cleanupStorageClass(ctx, config)
+				} else {
+					framework.Failf("no test volume to cleanup")
+				}
 			})
 
 			ginkgo.Context("One pod requesting one prebound PVC", func() {
@@ -959,7 +967,7 @@ func createLocalPVCsPVs(ctx context.Context, config *localTestConfig, volumes []
 			for _, volume := range volumes {
 				pvc, err := config.client.CoreV1().PersistentVolumeClaims(volume.pvc.Namespace).Get(ctx, volume.pvc.Name, metav1.GetOptions{})
 				if err != nil {
-					return false, fmt.Errorf("failed to get PVC %s/%s: %v", volume.pvc.Namespace, volume.pvc.Name, err)
+					return false, fmt.Errorf("failed to get PVC %s/%s: %w", volume.pvc.Namespace, volume.pvc.Name, err)
 				}
 				if pvc.Status.Phase != v1.ClaimPending {
 					return true, nil

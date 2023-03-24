@@ -84,7 +84,7 @@ func restartKubelet(ctx context.Context, host string) error {
 	result, err := e2essh.SSH(ctx, cmd, host, framework.TestContext.Provider)
 	if err != nil || result.Code != 0 {
 		e2essh.LogResult(result)
-		return fmt.Errorf("couldn't restart kubelet: %v", err)
+		return fmt.Errorf("couldn't restart kubelet: %w", err)
 	}
 	return nil
 }
@@ -120,7 +120,7 @@ var _ = utils.SIGDescribe("Volume Attach Verify [Feature:vsphere][Serial][Disrup
 		Bootstrap(f)
 		client = f.ClientSet
 		namespace = f.Namespace.Name
-		framework.ExpectNoError(e2enode.WaitForAllNodesSchedulable(ctx, client, framework.TestContext.NodeSchedulableTimeout))
+		framework.ExpectNoError(e2enode.WaitForAllNodesSchedulable(ctx, client, f.Timeouts.NodeSchedulable))
 
 		nodes, err := e2enode.GetReadySchedulableNodes(ctx, client)
 		framework.ExpectNoError(err)
