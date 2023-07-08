@@ -227,7 +227,7 @@ func (t *envelopeTransformer) TransformToStorage(ctx context.Context, data []byt
 }
 
 // addTransformerForDecryption inserts a new transformer to the Envelope cache of DEKs for future reads.
-func (t *envelopeTransformer) addTransformerForDecryption(cacheKey []byte, key []byte) (decryptTransformer, error) {
+func (t *envelopeTransformer) addTransformerForDecryption(cacheKey []byte, key []byte) (value.Read, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -265,6 +265,8 @@ func (t *envelopeTransformer) doDecode(originalData []byte) (*kmstypes.Encrypted
 	return o, nil
 }
 
+// GenerateTransformer generates a new transformer and encrypts the DEK using the envelope service.
+// It returns the transformer, the encrypted DEK, cache key and error.
 func GenerateTransformer(ctx context.Context, uid string, envelopeService kmsservice.Service) (value.Transformer, *kmsservice.EncryptResponse, []byte, error) {
 	transformer, newKey, err := aestransformer.NewGCMTransformerWithUniqueKeyUnsafe()
 	if err != nil {

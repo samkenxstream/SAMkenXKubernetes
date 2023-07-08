@@ -131,8 +131,8 @@ type KubeControllerManagerConfiguration struct {
 	JobController JobControllerConfiguration
 	// CronJobControllerConfiguration holds configuration for CronJobController related features.
 	CronJobController CronJobControllerConfiguration
-	// NamespaceControllerConfiguration holds configuration for NamespaceController
-	// related features.
+	// LegacySATokenCleanerConfiguration holds configuration for LegacySATokenCleaner related features.
+	LegacySATokenCleaner LegacySATokenCleanerConfiguration
 	// NamespaceControllerConfiguration holds configuration for NamespaceController
 	// related features.
 	NamespaceController NamespaceControllerConfiguration
@@ -357,6 +357,13 @@ type CronJobControllerConfiguration struct {
 	ConcurrentCronJobSyncs int32
 }
 
+// LegacySATokenCleanerConfiguration contains elements describing LegacySATokenCleaner
+type LegacySATokenCleanerConfiguration struct {
+	// CleanUpPeriod is the period of time since the last usage of an
+	// auto-generated service account token before it can be deleted.
+	CleanUpPeriod metav1.Duration
+}
+
 // NamespaceControllerConfiguration contains elements describing NamespaceController.
 type NamespaceControllerConfiguration struct {
 	// namespaceSyncPeriod is the period for syncing namespace life-cycle
@@ -412,10 +419,10 @@ type PersistentVolumeBinderControllerConfiguration struct {
 	PVClaimBinderSyncPeriod metav1.Duration
 	// volumeConfiguration holds configuration for volume related features.
 	VolumeConfiguration VolumeConfiguration
-	// VolumeHostCIDRDenylist is a list of CIDRs that should not be reachable by the
+	// DEPRECATED: VolumeHostCIDRDenylist is a list of CIDRs that should not be reachable by the
 	// controller from plugins.
 	VolumeHostCIDRDenylist []string
-	// VolumeHostAllowLocalLoopback indicates if local loopback hosts (127.0.0.1, etc)
+	// DEPRECATED: VolumeHostAllowLocalLoopback indicates if local loopback hosts (127.0.0.1, etc)
 	// should be allowed from plugins.
 	VolumeHostAllowLocalLoopback *bool
 }

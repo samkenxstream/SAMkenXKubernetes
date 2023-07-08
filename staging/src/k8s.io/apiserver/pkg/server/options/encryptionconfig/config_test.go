@@ -187,6 +187,7 @@ func TestLegacyConfig(t *testing.T) {
 
 func TestEncryptionProviderConfigCorrect(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.KMSv2, true)()
+
 	// Set factory for mock envelope service
 	factory := envelopeServiceFactory
 	factoryKMSv2 := EnvelopeKMSv2ServiceFactory
@@ -315,6 +316,37 @@ func TestEncryptionProviderConfigCorrect(t *testing.T) {
 				t.Fatalf("%s: %s transformer transformed data incorrectly. Expected: %v, got %v", testCase.Name, transformer.Name, originalText, untransformedData)
 			}
 		}
+	}
+}
+
+func TestKMSv1Deprecation(t *testing.T) {
+	testCases := []struct {
+		name         string
+		kmsv1Enabled bool
+		expectedErr  string
+	}{
+		{
+			name:         "config with kmsv1, KMSv1=false",
+			kmsv1Enabled: false,
+			expectedErr:  "KMSv1 is deprecated and will only receive security updates going forward. Use KMSv2 instead.  Set --feature-gates=KMSv1=true to use the deprecated KMSv1 feature.",
+		},
+		{
+			name:         "config with kmsv1, KMSv1=true",
+			kmsv1Enabled: true,
+			expectedErr:  "",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.KMSv1, testCase.kmsv1Enabled)()
+
+			kmsv1Config := "testdata/valid-configs/kms/multiple-providers.yaml"
+			_, err := LoadEncryptionConfig(testContext(t), kmsv1Config, false)
+			if !strings.Contains(errString(err), testCase.expectedErr) {
+				t.Fatalf("expected error %q, got %q", testCase.expectedErr, errString(err))
+			}
+		})
 	}
 }
 
@@ -717,6 +749,7 @@ func TestKMSPluginHealthz(t *testing.T) {
 
 // tests for masking rules
 func TestWildcardMasking(t *testing.T) {
+
 	testCases := []struct {
 		desc          string
 		config        *apiserverconfig.EncryptionConfiguration
@@ -1124,6 +1157,7 @@ func TestWildcardMasking(t *testing.T) {
 }
 
 func TestWildcardStructure(t *testing.T) {
+
 	testCases := []struct {
 		desc                         string
 		expectedResourceTransformers map[string]string
@@ -1703,7 +1737,7 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 		{
 			name:        "happy path, with previous state",
 			service:     &testKMSv2EnvelopeService{err: fmt.Errorf("broken")}, // not called
-			state:       validState("2", now),
+			state:       validState(t, "2", now),
 			statusKeyID: "2",
 			wantState: envelopekmsv2.State{
 				KeyID:               "2",
@@ -1716,7 +1750,7 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 		{
 			name:        "previous state expired but key ID matches",
 			service:     &testKMSv2EnvelopeService{err: fmt.Errorf("broken")}, // not called
-			state:       validState("3", now.Add(-time.Hour)),
+			state:       validState(t, "3", now.Add(-time.Hour)),
 			statusKeyID: "3",
 			wantState: envelopekmsv2.State{
 				KeyID:               "3",
@@ -1729,7 +1763,7 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 		{
 			name:        "previous state expired but key ID does not match",
 			service:     &testKMSv2EnvelopeService{keyID: "4"},
-			state:       validState("3", now.Add(-time.Hour)),
+			state:       validState(t, "3", now.Add(-time.Hour)),
 			statusKeyID: "4",
 			wantState: envelopekmsv2.State{
 				KeyID:               "4",
@@ -1746,7 +1780,7 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 		{
 			name:        "service down but key ID does not match",
 			service:     &testKMSv2EnvelopeService{err: fmt.Errorf("broken")},
-			state:       validState("4", now.Add(7*time.Minute)),
+			state:       validState(t, "4", now.Add(7*time.Minute)),
 			statusKeyID: "5",
 			wantState: envelopekmsv2.State{
 				KeyID:               "4",
@@ -1778,7 +1812,7 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 		{
 			name:        "invalid service response, with previous state",
 			service:     &testKMSv2EnvelopeService{keyID: "3", encryptAnnotations: map[string][]byte{"panda": nil}},
-			state:       validState("2", now),
+			state:       validState(t, "2", now),
 			statusKeyID: "3",
 			wantState: envelopekmsv2.State{
 				KeyID:               "2",
@@ -1831,17 +1865,52 @@ func Test_kmsv2PluginProbe_rotateDEKOnKeyIDChange(t *testing.T) {
 			if errString(err) != tt.wantErr {
 				t.Errorf("rotateDEKOnKeyIDChange() error = %v, wantErr %v", err, tt.wantErr)
 			}
+
+			// if the old or new state is valid, we should be able to use it
+			if _, stateErr := h.getCurrentState(); stateErr == nil || err == nil {
+				transformer := envelopekmsv2.NewEnvelopeTransformer(
+					&testKMSv2EnvelopeService{err: fmt.Errorf("broken")}, // not called
+					"panda",
+					h.getCurrentState,
+				)
+
+				dataCtx := value.DefaultContext(sampleContextText)
+				originalText := []byte(sampleText)
+
+				transformedData, err := transformer.TransformToStorage(ctx, originalText, dataCtx)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				untransformedData, stale, err := transformer.TransformFromStorage(ctx, transformedData, dataCtx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stale {
+					t.Error("unexpected stale data")
+				}
+				if !bytes.Equal(untransformedData, originalText) {
+					t.Fatalf("incorrect transformation, want: %v, got: %v", originalText, untransformedData)
+				}
+			}
 		})
 	}
 }
 
-func validState(keyID string, exp time.Time) envelopekmsv2.State {
+func validState(t *testing.T, keyID string, exp time.Time) envelopekmsv2.State {
+	t.Helper()
+
+	transformer, resp, cacheKey, err := envelopekmsv2.GenerateTransformer(testContext(t), "", &testKMSv2EnvelopeService{keyID: keyID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return envelopekmsv2.State{
-		Transformer:         &resourceTransformer{},
-		EncryptedDEK:        []byte{1},
-		KeyID:               keyID,
+		Transformer:         transformer,
+		EncryptedDEK:        resp.Ciphertext,
+		KeyID:               resp.KeyID,
+		Annotations:         resp.Annotations,
 		ExpirationTimestamp: exp,
-		CacheKey:            []byte{1},
+		CacheKey:            cacheKey,
 	}
 }
 

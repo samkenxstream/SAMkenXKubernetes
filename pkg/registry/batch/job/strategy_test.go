@@ -21,7 +21,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -186,7 +185,7 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 		},
 		"add tracking annotation back": {
 			job: batch.Job{
-				ObjectMeta: getValidObjectMetaWithAnnotations(0, map[string]string{batchv1.JobTrackingFinalizer: ""}),
+				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
 					Selector:         validSelector,
 					Template:         validPodTemplateSpec,
@@ -201,7 +200,7 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 				},
 			},
 			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMetaWithAnnotations(1, map[string]string{batchv1.JobTrackingFinalizer: ""}),
+				ObjectMeta: getValidObjectMeta(1),
 				Spec: batch.JobSpec{
 					Selector: validSelector,
 					Template: validPodTemplateSpec,
@@ -373,7 +372,7 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMetaWithAnnotations(1, map[string]string{batchv1.JobTrackingFinalizer: ""}),
+				ObjectMeta: getValidObjectMeta(1),
 				Spec: batch.JobSpec{
 					Selector:         validSelector,
 					Template:         validPodTemplateSpec,
@@ -392,7 +391,7 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMetaWithAnnotations(1, map[string]string{batchv1.JobTrackingFinalizer: ""}),
+				ObjectMeta: getValidObjectMeta(1),
 				Spec: batch.JobSpec{
 					Selector:         validSelector,
 					Template:         validPodTemplateSpec,
@@ -412,7 +411,7 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMetaWithAnnotations(1, map[string]string{batchv1.JobTrackingFinalizer: ""}),
+				ObjectMeta: getValidObjectMeta(1),
 				Spec: batch.JobSpec{
 					Selector: validSelector,
 					Template: validPodTemplateSpec,
@@ -514,28 +513,6 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 			},
 			wantErrs: field.ErrorList{
 				{Type: field.ErrorTypeInvalid, Field: "spec.completions"},
-			},
-		},
-		"adding tracking annotation disallowed": {
-			job: &batch.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "myjob",
-					Namespace:       metav1.NamespaceDefault,
-					ResourceVersion: "0",
-					Annotations:     map[string]string{"foo": "bar"},
-				},
-				Spec: batch.JobSpec{
-					Selector:       validSelector,
-					Template:       validPodTemplateSpec,
-					ManualSelector: pointer.BoolPtr(true),
-					Parallelism:    pointer.Int32Ptr(1),
-				},
-			},
-			update: func(job *batch.Job) {
-				job.Annotations[batch.JobTrackingFinalizer] = ""
-			},
-			wantErrs: field.ErrorList{
-				{Type: field.ErrorTypeForbidden, Field: "metadata.annotations[batch.kubernetes.io/job-tracking]"},
 			},
 		},
 		"preserving tracking annotation": {
@@ -836,7 +813,7 @@ func TestJobStrategy_WarningsOnUpdate(t *testing.T) {
 				Spec: batch.JobSpec{
 					Selector: validSelector,
 					Template: api.PodTemplateSpec{
-						Spec: api.PodSpec{Volumes: []api.Volume{{Name: "volume-name"}, {Name: "volume-name"}}},
+						Spec: api.PodSpec{ImagePullSecrets: []api.LocalObjectReference{{Name: ""}}},
 					},
 					ManualSelector: pointer.BoolPtr(true),
 					Parallelism:    pointer.Int32Ptr(1),
@@ -859,6 +836,37 @@ func TestJobStrategy_WarningsOnUpdate(t *testing.T) {
 			},
 			wantWarningsCount: 1,
 		},
+		"Invalid transition to high parallelism": {
+			wantWarningsCount: 1,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob2",
+					Namespace:       metav1.NamespaceDefault,
+					Generation:      1,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					CompletionMode: completionModePtr(batch.IndexedCompletion),
+					Completions:    pointer.Int32(100_001),
+					Parallelism:    pointer.Int32(10_001),
+					Template:       validPodTemplateSpec,
+				},
+			},
+			oldJob: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob2",
+					Namespace:       metav1.NamespaceDefault,
+					Generation:      0,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					CompletionMode: completionModePtr(batch.IndexedCompletion),
+					Completions:    pointer.Int32(100_001),
+					Parallelism:    pointer.Int32(10_000),
+					Template:       validPodTemplateSpec,
+				},
+			},
+		},
 	}
 	for val, tc := range cases {
 		t.Run(val, func(t *testing.T) {
@@ -876,18 +884,20 @@ func TestJobStrategy_WarningsOnCreate(t *testing.T) {
 	validSelector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{"a": "b"},
 	}
-	validSpec := batch.JobSpec{
-		Selector: nil,
-		Template: api.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: validSelector.MatchLabels,
-			},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyOnFailure,
-				DNSPolicy:     api.DNSClusterFirst,
-				Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-			},
+	validPodTemplate := api.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: validSelector.MatchLabels,
 		},
+		Spec: api.PodSpec{
+			RestartPolicy: api.RestartPolicyOnFailure,
+			DNSPolicy:     api.DNSClusterFirst,
+			Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
+		},
+	}
+	validSpec := batch.JobSpec{
+		CompletionMode: completionModePtr(batch.NonIndexedCompletion),
+		Selector:       nil,
+		Template:       validPodTemplate,
 	}
 
 	testcases := map[string]struct {
@@ -913,6 +923,22 @@ func TestJobStrategy_WarningsOnCreate(t *testing.T) {
 					UID:       theUID,
 				},
 				Spec: validSpec,
+			},
+		},
+		"high completions and parallelism": {
+			wantWarningsCount: 1,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "myjob2",
+					Namespace: metav1.NamespaceDefault,
+					UID:       theUID,
+				},
+				Spec: batch.JobSpec{
+					CompletionMode: completionModePtr(batch.IndexedCompletion),
+					Parallelism:    pointer.Int32(100_001),
+					Completions:    pointer.Int32(100_001),
+					Template:       validPodTemplate,
+				},
 			},
 		},
 	}

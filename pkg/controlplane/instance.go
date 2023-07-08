@@ -35,23 +35,17 @@ import (
 	authorizationapiv1 "k8s.io/api/authorization/v1"
 	autoscalingapiv1 "k8s.io/api/autoscaling/v1"
 	autoscalingapiv2 "k8s.io/api/autoscaling/v2"
-	autoscalingapiv2beta1 "k8s.io/api/autoscaling/v2beta1"
-	autoscalingapiv2beta2 "k8s.io/api/autoscaling/v2beta2"
 	batchapiv1 "k8s.io/api/batch/v1"
-	batchapiv1beta1 "k8s.io/api/batch/v1beta1"
 	certificatesapiv1 "k8s.io/api/certificates/v1"
 	certificatesv1alpha1 "k8s.io/api/certificates/v1alpha1"
 	coordinationapiv1 "k8s.io/api/coordination/v1"
 	apiv1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	discoveryv1beta1 "k8s.io/api/discovery/v1beta1"
 	eventsv1 "k8s.io/api/events/v1"
-	eventsv1beta1 "k8s.io/api/events/v1beta1"
 	flowcontrolv1alpha1 "k8s.io/api/flowcontrol/v1alpha1"
 	networkingapiv1 "k8s.io/api/networking/v1"
 	networkingapiv1alpha1 "k8s.io/api/networking/v1alpha1"
 	nodev1 "k8s.io/api/node/v1"
-	nodev1beta1 "k8s.io/api/node/v1beta1"
 	policyapiv1 "k8s.io/api/policy/v1"
 	policyapiv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -83,8 +77,10 @@ import (
 	flowcontrolv1beta1 "k8s.io/kubernetes/pkg/apis/flowcontrol/v1beta1"
 	flowcontrolv1beta2 "k8s.io/kubernetes/pkg/apis/flowcontrol/v1beta2"
 	flowcontrolv1beta3 "k8s.io/kubernetes/pkg/apis/flowcontrol/v1beta3"
+	"k8s.io/kubernetes/pkg/controlplane/apiserver/options"
 	"k8s.io/kubernetes/pkg/controlplane/controller/apiserverleasegc"
 	"k8s.io/kubernetes/pkg/controlplane/controller/clusterauthenticationtrust"
+	"k8s.io/kubernetes/pkg/controlplane/controller/kubernetesservice"
 	"k8s.io/kubernetes/pkg/controlplane/controller/legacytokentracking"
 	"k8s.io/kubernetes/pkg/controlplane/controller/systemnamespaces"
 	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
@@ -301,7 +297,7 @@ func (c *Config) Complete() CompletedConfig {
 		&c.ExtraConfig,
 	}
 
-	serviceIPRange, apiServerServiceIP, err := ServiceIPRange(cfg.ExtraConfig.ServiceIPRange)
+	serviceIPRange, apiServerServiceIP, err := options.ServiceIPRange(cfg.ExtraConfig.ServiceIPRange)
 	if err != nil {
 		klog.Fatalf("Error determining service IP ranges: %v", err)
 	}
@@ -579,21 +575,23 @@ func labelAPIServerHeartbeatFunc(identity string) lease.ProcessLeaseFunc {
 // InstallLegacyAPI will install the legacy APIs for the restStorageProviders if they are enabled.
 func (m *Instance) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.RESTOptionsGetter) error {
 	legacyRESTStorageProvider := corerest.LegacyRESTStorageProvider{
-		StorageFactory:              c.ExtraConfig.StorageFactory,
-		ProxyTransport:              c.ExtraConfig.ProxyTransport,
-		KubeletClientConfig:         c.ExtraConfig.KubeletClientConfig,
-		EventTTL:                    c.ExtraConfig.EventTTL,
-		ServiceIPRange:              c.ExtraConfig.ServiceIPRange,
-		SecondaryServiceIPRange:     c.ExtraConfig.SecondaryServiceIPRange,
-		ServiceNodePortRange:        c.ExtraConfig.ServiceNodePortRange,
-		LoopbackClientConfig:        c.GenericConfig.LoopbackClientConfig,
-		ServiceAccountIssuer:        c.ExtraConfig.ServiceAccountIssuer,
-		ExtendExpiration:            c.ExtraConfig.ExtendExpiration,
-		ServiceAccountMaxExpiration: c.ExtraConfig.ServiceAccountMaxExpiration,
-		APIAudiences:                c.GenericConfig.Authentication.APIAudiences,
-		Informers:                   c.ExtraConfig.VersionedInformers,
+		GenericLegacyRESTStorageProvider: corerest.GenericLegacyRESTStorageProvider{
+			StorageFactory:              c.ExtraConfig.StorageFactory,
+			EventTTL:                    c.ExtraConfig.EventTTL,
+			LoopbackClientConfig:        c.GenericConfig.LoopbackClientConfig,
+			ServiceAccountIssuer:        c.ExtraConfig.ServiceAccountIssuer,
+			ExtendExpiration:            c.ExtraConfig.ExtendExpiration,
+			ServiceAccountMaxExpiration: c.ExtraConfig.ServiceAccountMaxExpiration,
+			APIAudiences:                c.GenericConfig.Authentication.APIAudiences,
+			Informers:                   c.ExtraConfig.VersionedInformers,
+		},
+		ProxyTransport:          c.ExtraConfig.ProxyTransport,
+		KubeletClientConfig:     c.ExtraConfig.KubeletClientConfig,
+		ServiceIPRange:          c.ExtraConfig.ServiceIPRange,
+		SecondaryServiceIPRange: c.ExtraConfig.SecondaryServiceIPRange,
+		ServiceNodePortRange:    c.ExtraConfig.ServiceNodePortRange,
 	}
-	legacyRESTStorage, apiGroupInfo, err := legacyRESTStorageProvider.NewLegacyRESTStorage(c.ExtraConfig.APIResourceConfigSource, restOptionsGetter)
+	rangeRegistries, apiGroupInfo, err := legacyRESTStorageProvider.NewLegacyRESTStorage(c.ExtraConfig.APIResourceConfigSource, restOptionsGetter)
 	if err != nil {
 		return fmt.Errorf("error building core storage: %v", err)
 	}
@@ -610,17 +608,55 @@ func (m *Instance) InstallLegacyAPI(c *completedConfig, restOptionsGetter generi
 		return nil
 	})
 
-	bootstrapController, err := c.NewBootstrapController(legacyRESTStorage, client)
+	kubenetesserviceConfig, err := c.newKubernetesServiceControllerConfig(client)
+	if err != nil {
+		return err
+	}
+	bootstrapController, err := kubernetesservice.New(*kubenetesserviceConfig, rangeRegistries)
 	if err != nil {
 		return fmt.Errorf("error creating bootstrap controller: %v", err)
 	}
-	m.GenericAPIServer.AddPostStartHookOrDie(controllerName, bootstrapController.PostStartHook)
-	m.GenericAPIServer.AddPreShutdownHookOrDie(controllerName, bootstrapController.PreShutdownHook)
+	m.GenericAPIServer.AddPostStartHookOrDie(controllerName, func(genericapiserver.PostStartHookContext) error { bootstrapController.Start(); return nil })
+	m.GenericAPIServer.AddPreShutdownHookOrDie(controllerName, func() error { bootstrapController.Stop(); return nil })
 
 	if err := m.GenericAPIServer.InstallLegacyAPIGroup(genericapiserver.DefaultLegacyAPIPrefix, &apiGroupInfo); err != nil {
 		return fmt.Errorf("error in registering group versions: %v", err)
 	}
 	return nil
+}
+
+// newKubernetesServiceControllerConfig returns a configuration for the kubernetes service controller.
+func (c completedConfig) newKubernetesServiceControllerConfig(client kubernetes.Interface) (*kubernetesservice.Config, error) {
+	_, publicServicePort, err := c.GenericConfig.SecureServing.HostPort()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get listener address: %w", err)
+	}
+
+	return &kubernetesservice.Config{
+		Client:    client,
+		Informers: c.ExtraConfig.VersionedInformers,
+		KubernetesService: kubernetesservice.KubernetesService{
+			PublicIP: c.GenericConfig.PublicAddress,
+
+			EndpointReconciler: c.ExtraConfig.EndpointReconcilerConfig.Reconciler,
+			EndpointInterval:   c.ExtraConfig.EndpointReconcilerConfig.Interval,
+
+			ServiceIP:                 c.ExtraConfig.APIServerServiceIP,
+			ServicePort:               c.ExtraConfig.APIServerServicePort,
+			PublicServicePort:         publicServicePort,
+			KubernetesServiceNodePort: c.ExtraConfig.KubernetesServiceNodePort,
+		},
+		ClusterIP: kubernetesservice.ClusterIP{
+			ServiceClusterIPRange:          c.ExtraConfig.ServiceIPRange,
+			SecondaryServiceClusterIPRange: c.ExtraConfig.SecondaryServiceIPRange,
+
+			ServiceClusterIPInterval: c.ExtraConfig.RepairServicesInterval,
+		},
+		NodePort: kubernetesservice.NodePort{
+			ServiceNodePortRange:    c.ExtraConfig.ServiceNodePortRange,
+			ServiceNodePortInterval: c.ExtraConfig.RepairServicesInterval,
+		},
+	}, nil
 }
 
 // RESTStorageProvider is a factory type for REST storage.
@@ -716,12 +752,6 @@ var (
 	// betaAPIGroupVersionsDisabledByDefault is for all future beta groupVersions.
 	betaAPIGroupVersionsDisabledByDefault = []schema.GroupVersion{
 		authenticationv1beta1.SchemeGroupVersion,
-		autoscalingapiv2beta1.SchemeGroupVersion,
-		autoscalingapiv2beta2.SchemeGroupVersion,
-		batchapiv1beta1.SchemeGroupVersion,
-		discoveryv1beta1.SchemeGroupVersion,
-		eventsv1beta1.SchemeGroupVersion,
-		nodev1beta1.SchemeGroupVersion, // remove in 1.26
 		policyapiv1beta1.SchemeGroupVersion,
 		storageapiv1beta1.SchemeGroupVersion,
 		flowcontrolv1beta1.SchemeGroupVersion,

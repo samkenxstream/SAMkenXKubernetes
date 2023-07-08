@@ -34,10 +34,10 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
 	podresourcesgrpc "k8s.io/kubernetes/pkg/kubelet/apis/podresources/grpc"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
-	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 	testutils "k8s.io/kubernetes/test/utils"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/cpuset"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -571,7 +571,7 @@ func podresourcesGetAllocatableResourcesTests(ctx context.Context, cli kubeletpo
 // Serial because the test updates kubelet configuration.
 var _ = SIGDescribe("POD Resources [Serial] [Feature:PodResources][NodeFeature:PodResources]", func() {
 	f := framework.NewDefaultFramework("podresources-test")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	reservedSystemCPUs := cpuset.New(1)
 
@@ -903,6 +903,14 @@ var _ = SIGDescribe("POD Resources [Serial] [Feature:PodResources][NodeFeature:P
 			gomega.Expect(errLimitExceededCount).ToNot(gomega.BeZero(), "never hit the rate limit trying %d calls in %v", tries, elapsed)
 
 			framework.Logf("got %d/%d rate limit errors, at least one needed, the more the better", errLimitExceededCount, tries)
+
+			// this is not needed for this test. We're done. But we need to play nice with *other* tests which may run just after,
+			// and which need to query the API. If they run "too fast", they can still be throttled because the throttling period
+			// is not exhausted yet, yielding false negatives, leading to flakes.
+			// We can't reset the period for the rate limit, we just wait "long enough" to make sure we absorb the burst
+			// and other queries are not rejected because happening to soon
+			ginkgo.By("Cooling down to reset the podresources API rate limit")
+			time.Sleep(5 * time.Second)
 		})
 	})
 })
@@ -965,7 +973,7 @@ func waitForTopologyUnawareResources(ctx context.Context, f *framework.Framework
 func getPodResourcesMetrics(ctx context.Context) (e2emetrics.KubeletMetrics, error) {
 	// we are running out of good names, so we need to be unnecessarily specific to avoid clashes
 	ginkgo.By("getting Pod Resources metrics from the metrics API")
-	return e2emetrics.GrabKubeletMetricsWithoutProxy(ctx, framework.TestContext.NodeName+":10255", "/metrics")
+	return e2emetrics.GrabKubeletMetricsWithoutProxy(ctx, nodeNameOrIP()+":10255", "/metrics")
 }
 
 func timelessSampleAtLeast(lower interface{}) types.GomegaMatcher {
@@ -974,5 +982,6 @@ func timelessSampleAtLeast(lower interface{}) types.GomegaMatcher {
 		"Metric":    gstruct.Ignore(),
 		"Value":     gomega.BeNumerically(">=", lower),
 		"Timestamp": gstruct.Ignore(),
+		"Histogram": gstruct.Ignore(),
 	}))
 }

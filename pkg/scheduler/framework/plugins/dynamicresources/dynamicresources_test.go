@@ -104,7 +104,7 @@ var (
 				Obj()
 	inUseClaim = st.FromResourceClaim(pendingImmediateClaim).
 			Allocation(&resourcev1alpha2.AllocationResult{}).
-			ReservedFor(resourcev1alpha2.ResourceClaimConsumerReference{UID: types.UID(podUID)}).
+			ReservedFor(resourcev1alpha2.ResourceClaimConsumerReference{Resource: "pods", Name: podName, UID: types.UID(podUID)}).
 			Obj()
 	allocatedClaim = st.FromResourceClaim(pendingDelayedClaim).
 			OwnerReference(podName, podUID, podKind).
@@ -207,17 +207,52 @@ func TestPlugin(t *testing.T) {
 
 		prepare prepare
 		want    want
+		disable bool
 	}{
 		"empty": {
 			pod: st.MakePod().Name("foo").Namespace("default").Obj(),
+			want: want{
+				prefilter: result{
+					status: framework.NewStatus(framework.Skip),
+				},
+				postfilter: result{
+					status: framework.NewStatus(framework.Unschedulable, `no new claims to deallocate`),
+				},
+			},
 		},
 		"claim-reference": {
 			pod:    podWithClaimName,
 			claims: []*resourcev1alpha2.ResourceClaim{allocatedClaim, otherClaim},
+			want: want{
+				reserve: result{
+					changes: change{
+						claim: func(claim *resourcev1alpha2.ResourceClaim) *resourcev1alpha2.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Status.ReservedFor = inUseClaim.Status.ReservedFor
+							}
+							return claim
+						},
+					},
+				},
+			},
 		},
 		"claim-template": {
 			pod:    podWithClaimTemplate,
 			claims: []*resourcev1alpha2.ResourceClaim{allocatedClaim, otherClaim},
+			want: want{
+				reserve: result{
+					changes: change{
+						claim: func(claim *resourcev1alpha2.ResourceClaim) *resourcev1alpha2.ResourceClaim {
+							if claim.Name == claimName {
+								claim = claim.DeepCopy()
+								claim.Status.ReservedFor = inUseClaim.Status.ReservedFor
+							}
+							return claim
+						},
+					},
+				},
+			},
 		},
 		"missing-claim": {
 			pod: podWithClaimTemplate,
@@ -437,6 +472,16 @@ func TestPlugin(t *testing.T) {
 			pod:    podWithClaimName,
 			claims: []*resourcev1alpha2.ResourceClaim{inUseClaim},
 		},
+		"disable": {
+			pod:    podWithClaimName,
+			claims: []*resourcev1alpha2.ResourceClaim{inUseClaim},
+			want: want{
+				prefilter: result{
+					status: framework.NewStatus(framework.Skip),
+				},
+			},
+			disable: true,
+		},
 	}
 
 	for name, tc := range testcases {
@@ -449,6 +494,7 @@ func TestPlugin(t *testing.T) {
 				nodes = []*v1.Node{workerNode}
 			}
 			testCtx := setup(t, nodes, tc.claims, tc.classes, tc.schedulings)
+			testCtx.p.enabled = !tc.disable
 
 			initialObjects := testCtx.listAll(t)
 			result, status := testCtx.p.PreFilter(testCtx.ctx, testCtx.state, tc.pod)
@@ -456,6 +502,9 @@ func TestPlugin(t *testing.T) {
 				assert.Equal(t, tc.want.preFilterResult, result)
 				testCtx.verify(t, tc.want.prefilter, initialObjects, result, status)
 			})
+			if status.IsSkip() {
+				return
+			}
 			unschedulable := status.Code() != framework.Success
 
 			var potentialNodes []*v1.Node
@@ -589,11 +638,13 @@ func (tc *testContext) listAll(t *testing.T) (objects []metav1.Object) {
 	claims, err := tc.client.ResourceV1alpha2().ResourceClaims("").List(tc.ctx, metav1.ListOptions{})
 	require.NoError(t, err, "list claims")
 	for _, claim := range claims.Items {
+		claim := claim
 		objects = append(objects, &claim)
 	}
 	schedulings, err := tc.client.ResourceV1alpha2().PodSchedulingContexts("").List(tc.ctx, metav1.ListOptions{})
 	require.NoError(t, err, "list pod scheduling")
 	for _, scheduling := range schedulings.Items {
+		scheduling := scheduling
 		objects = append(objects, &scheduling)
 	}
 
@@ -680,7 +731,7 @@ func setup(t *testing.T, nodes []*v1.Node, claims []*resourcev1alpha2.ResourceCl
 		runtime.WithClientSet(tc.client),
 		runtime.WithInformerFactory(informerFactory),
 	}
-	fh, err := runtime.NewFramework(nil, nil, tc.ctx.Done(), opts...)
+	fh, err := runtime.NewFramework(ctx, nil, nil, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

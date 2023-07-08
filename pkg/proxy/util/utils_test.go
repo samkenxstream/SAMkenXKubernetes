@@ -17,7 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"context"
 	"math/rand"
 	"net"
 	"reflect"
@@ -93,109 +92,6 @@ func TestBuildPortsToEndpointsMap(t *testing.T) {
 	portsToEndpoints := BuildPortsToEndpointsMap(endpoints)
 	if !reflect.DeepEqual(expectedPortsToEndpoints, portsToEndpoints) {
 		t.Errorf("expected ports to endpoints not seen")
-	}
-}
-
-func TestIsProxyableIP(t *testing.T) {
-	testCases := []struct {
-		ip   string
-		want error
-	}{
-		{"0.0.0.0", ErrAddressNotAllowed},
-		{"127.0.0.1", ErrAddressNotAllowed},
-		{"127.0.0.2", ErrAddressNotAllowed},
-		{"169.254.169.254", ErrAddressNotAllowed},
-		{"169.254.1.1", ErrAddressNotAllowed},
-		{"224.0.0.0", ErrAddressNotAllowed},
-		{"10.0.0.1", nil},
-		{"192.168.0.1", nil},
-		{"172.16.0.1", nil},
-		{"8.8.8.8", nil},
-		{"::", ErrAddressNotAllowed},
-		{"::1", ErrAddressNotAllowed},
-		{"fe80::", ErrAddressNotAllowed},
-		{"ff02::", ErrAddressNotAllowed},
-		{"ff01::", ErrAddressNotAllowed},
-		{"2600::", nil},
-		{"1", ErrAddressNotAllowed},
-		{"", ErrAddressNotAllowed},
-	}
-
-	for i := range testCases {
-		got := IsProxyableIP(testCases[i].ip)
-		if testCases[i].want != got {
-			t.Errorf("case %d: expected %v, got %v", i, testCases[i].want, got)
-		}
-	}
-}
-
-type dummyResolver struct {
-	ips []string
-	err error
-}
-
-func (r *dummyResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
-	if r.err != nil {
-		return nil, r.err
-	}
-	resp := []net.IPAddr{}
-	for _, ipString := range r.ips {
-		resp = append(resp, net.IPAddr{IP: netutils.ParseIPSloppy(ipString)})
-	}
-	return resp, nil
-}
-
-func TestIsProxyableHostname(t *testing.T) {
-	testCases := []struct {
-		hostname string
-		ips      []string
-		want     error
-	}{
-		{"k8s.io", []string{}, ErrNoAddresses},
-		{"k8s.io", []string{"8.8.8.8"}, nil},
-		{"k8s.io", []string{"169.254.169.254"}, ErrAddressNotAllowed},
-		{"k8s.io", []string{"127.0.0.1", "8.8.8.8"}, ErrAddressNotAllowed},
-	}
-
-	for i := range testCases {
-		resolv := dummyResolver{ips: testCases[i].ips}
-		got := IsProxyableHostname(context.Background(), &resolv, testCases[i].hostname)
-		if testCases[i].want != got {
-			t.Errorf("case %d: expected %v, got %v", i, testCases[i].want, got)
-		}
-	}
-}
-
-func TestIsAllowedHost(t *testing.T) {
-	testCases := []struct {
-		ip     string
-		denied []string
-		want   error
-	}{
-		{"8.8.8.8", []string{}, nil},
-		{"169.254.169.254", []string{"169.0.0.0/8"}, ErrAddressNotAllowed},
-		{"169.254.169.254", []string{"fce8::/15", "169.254.169.0/24"}, ErrAddressNotAllowed},
-		{"fce9:beef::", []string{"fce8::/15", "169.254.169.0/24"}, ErrAddressNotAllowed},
-		{"127.0.0.1", []string{"127.0.0.1/32"}, ErrAddressNotAllowed},
-		{"34.107.204.206", []string{"fce8::/15"}, nil},
-		{"fce9:beef::", []string{"127.0.0.1/32"}, nil},
-		{"34.107.204.206", []string{"127.0.0.1/32"}, nil},
-		{"127.0.0.1", []string{}, nil},
-	}
-
-	for i := range testCases {
-		var denyList []*net.IPNet
-		for _, cidrStr := range testCases[i].denied {
-			_, ipNet, err := netutils.ParseCIDRSloppy(cidrStr)
-			if err != nil {
-				t.Fatalf("bad IP for test case: %v: %v", cidrStr, err)
-			}
-			denyList = append(denyList, ipNet)
-		}
-		got := IsAllowedHost(netutils.ParseIPSloppy(testCases[i].ip), denyList)
-		if testCases[i].want != got {
-			t.Errorf("case %d: expected %v, got %v", i, testCases[i].want, got)
-		}
 	}
 }
 
@@ -276,125 +172,6 @@ func TestShouldSkipService(t *testing.T) {
 			t.Errorf("case %d: expect %v, got %v", i, testCases[i].shouldSkip, skip)
 		}
 	}
-}
-
-func TestNewFilteredDialContext(t *testing.T) {
-
-	_, cidr, _ := netutils.ParseCIDRSloppy("1.1.1.1/28")
-
-	testCases := []struct {
-		name string
-
-		// opts passed to NewFilteredDialContext
-		opts *FilteredDialOptions
-
-		// value passed to dial
-		dial string
-
-		// value expected to be passed to resolve
-		expectResolve string
-		// result from resolver
-		resolveTo  []net.IPAddr
-		resolveErr error
-
-		// expect the wrapped dialer to be called
-		expectWrappedDial bool
-		// expect an error result
-		expectErr string
-	}{
-		{
-			name:              "allow with nil opts",
-			opts:              nil,
-			dial:              "127.0.0.1:8080",
-			expectResolve:     "", // resolver not called, no-op opts
-			expectWrappedDial: true,
-			expectErr:         "",
-		},
-		{
-			name:              "allow localhost",
-			opts:              &FilteredDialOptions{AllowLocalLoopback: true},
-			dial:              "127.0.0.1:8080",
-			expectResolve:     "", // resolver not called, no-op opts
-			expectWrappedDial: true,
-			expectErr:         "",
-		},
-		{
-			name:              "disallow localhost",
-			opts:              &FilteredDialOptions{AllowLocalLoopback: false},
-			dial:              "127.0.0.1:8080",
-			expectResolve:     "127.0.0.1",
-			resolveTo:         []net.IPAddr{{IP: netutils.ParseIPSloppy("127.0.0.1")}},
-			expectWrappedDial: false,
-			expectErr:         "address not allowed",
-		},
-		{
-			name:              "disallow IP",
-			opts:              &FilteredDialOptions{AllowLocalLoopback: false, DialHostCIDRDenylist: []*net.IPNet{cidr}},
-			dial:              "foo.com:8080",
-			expectResolve:     "foo.com",
-			resolveTo:         []net.IPAddr{{IP: netutils.ParseIPSloppy("1.1.1.1")}},
-			expectWrappedDial: false,
-			expectErr:         "address not allowed",
-		},
-		{
-			name:              "allow IP",
-			opts:              &FilteredDialOptions{AllowLocalLoopback: false, DialHostCIDRDenylist: []*net.IPNet{cidr}},
-			dial:              "foo.com:8080",
-			expectResolve:     "foo.com",
-			resolveTo:         []net.IPAddr{{IP: netutils.ParseIPSloppy("2.2.2.2")}},
-			expectWrappedDial: true,
-			expectErr:         "",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			wrappedDialer := &testDialer{}
-			testResolver := &testResolver{addrs: tc.resolveTo, err: tc.resolveErr}
-			dialer := NewFilteredDialContext(wrappedDialer.DialContext, testResolver, tc.opts)
-			_, err := dialer(context.TODO(), "tcp", tc.dial)
-
-			if tc.expectResolve != testResolver.resolveAddress {
-				t.Fatalf("expected to resolve %s, got %s", tc.expectResolve, testResolver.resolveAddress)
-			}
-			if tc.expectWrappedDial != wrappedDialer.called {
-				t.Fatalf("expected wrapped dialer called %v, got %v", tc.expectWrappedDial, wrappedDialer.called)
-			}
-
-			if err != nil {
-				if len(tc.expectErr) == 0 {
-					t.Fatalf("unexpected error: %v", err)
-				} else if !strings.Contains(err.Error(), tc.expectErr) {
-					t.Fatalf("expected error containing %q, got %v", tc.expectErr, err)
-				}
-			} else {
-				if len(tc.expectErr) > 0 {
-					t.Fatalf("expected error, got none")
-				}
-			}
-		})
-	}
-}
-
-type testDialer struct {
-	called bool
-}
-
-func (t *testDialer) DialContext(_ context.Context, network, address string) (net.Conn, error) {
-	t.called = true
-	return nil, nil
-}
-
-type testResolver struct {
-	addrs []net.IPAddr
-	err   error
-
-	resolveAddress string
-}
-
-func (t *testResolver) LookupIPAddr(_ context.Context, address string) ([]net.IPAddr, error) {
-	t.resolveAddress = address
-	return t.addrs, t.err
 }
 
 func TestAppendPortIfNeeded(t *testing.T) {
@@ -962,7 +739,7 @@ func TestLineBufferWrite(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			testBuffer.Reset()
 			testBuffer.Write(testCase.input...)
-			if want, got := testCase.expected, string(testBuffer.Bytes()); !strings.EqualFold(want, got) {
+			if want, got := testCase.expected, testBuffer.String(); !strings.EqualFold(want, got) {
 				t.Fatalf("write word is %v\n expected: %q, got: %q", testCase.input, want, got)
 			}
 			if testBuffer.Lines() != 1 {
@@ -1005,7 +782,7 @@ func TestLineBufferWriteBytes(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			testBuffer.Reset()
 			testBuffer.WriteBytes(testCase.bytes)
-			if want, got := testCase.expected, string(testBuffer.Bytes()); !strings.EqualFold(want, got) {
+			if want, got := testCase.expected, testBuffer.String(); !strings.EqualFold(want, got) {
 				t.Fatalf("write bytes is %v\n expected: %s, got: %s", testCase.bytes, want, got)
 			}
 		})

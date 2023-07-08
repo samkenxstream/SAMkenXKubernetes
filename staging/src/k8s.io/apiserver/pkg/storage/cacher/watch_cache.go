@@ -305,7 +305,7 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64, upd
 
 	if err := func() error {
 		// TODO: We should consider moving this lock below after the watchCacheEvent
-		// is created. In such situation, the only problematic scenario is Replace(
+		// is created. In such situation, the only problematic scenario is Replace()
 		// happening after getting object from store and before acquiring a lock.
 		// Maybe introduce another lock for this purpose.
 		w.Lock()
@@ -608,8 +608,8 @@ func (w *watchCache) Resync() error {
 }
 
 func (w *watchCache) currentCapacity() int {
-	w.Lock()
-	defer w.Unlock()
+	w.RLock()
+	defer w.RUnlock()
 	return w.capacity
 }
 
